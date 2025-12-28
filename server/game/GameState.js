@@ -1,0 +1,443 @@
+import { HitDetection } from './HitDetection.js';
+import { GAME_CONSTANTS, MATCH_STATUS } from '../../shared/constants.js';
+import { MAP_GEOMETRY, checkMapCollision } from '../../shared/MapData.js';
+
+export class GameState {
+    constructor(matchId, inviteCode, io, settings = {}) {
+        this.matchId = matchId;
+        this.inviteCode = inviteCode;
+        this.io = io;
+
+        this.status = MATCH_STATUS.WAITING;
+        this.players = new Map(); // playerId -> PlayerState
+
+        // Settings
+        this.roundsToWin = settings.rounds || GAME_CONSTANTS.ROUNDS_TO_WIN;
+        this.autoRematch = settings.autoRematch || false;
+        this.infiniteAmmo = settings.infiniteAmmo || false;
+
+        this.round = 1;
+        this.scores = {}; // playerId -> score
+        this.roundStartTime = 0;
+        this.timeRemaining = GAME_CONSTANTS.ROUND_TIME;
+
+        this.hitDetection = new HitDetection();
+        this.stateHistory = []; // For lag compensation
+
+        this.tickInterval = null;
+    }
+
+    addPlayer(playerId, socket, nickname) {
+        const spawnPosition = this.getSpawnPosition();
+
+        const playerState = {
+            id: playerId,
+            socket,
+            nickname: nickname || `Player ${this.players.size + 1}`,
+            position: spawnPosition,
+            rotation: { pitch: 0, yaw: 0 },
+            velocity: { x: 0, y: 0, z: 0 },
+            health: GAME_CONSTANTS.MAX_HEALTH,
+            ammo: GAME_CONSTANTS.MAGAZINE_SIZE,
+            reserveAmmo: GAME_CONSTANTS.RESERVE_AMMO,
+            isScoped: false,
+            isDead: false
+        };
+
+        this.players.set(playerId, playerState);
+        this.scores[playerId] = 0; // Initialize score
+    }
+
+    isFull() {
+        return this.players.size >= GAME_CONSTANTS.MAX_PLAYERS;
+    }
+
+    isEmpty() {
+        return this.players.size === 0;
+    }
+
+    startGame() {
+        if (this.status !== MATCH_STATUS.WAITING) return;
+        if (this.players.size < 2) return;
+
+        this.status = MATCH_STATUS.IN_PROGRESS;
+        // Notify clients FIRST so they initialize the game
+        this.io.to(this.matchId).emit('gameStart', {
+            round: this.round,
+            scores: this.scores,
+            roundsToWin: this.roundsToWin
+        });
+
+        this.startRound();
+
+        // Start game tick
+        this.tickInterval = setInterval(() => this.tick(), GAME_CONSTANTS.TICK_INTERVAL);
+    }
+
+    startRound() {
+        this.roundStartTime = Date.now();
+        this.timeRemaining = GAME_CONSTANTS.ROUND_TIME;
+
+        // Reset players
+        for (const [playerId, player] of this.players) {
+            player.health = GAME_CONSTANTS.MAX_HEALTH;
+            player.ammo = GAME_CONSTANTS.MAGAZINE_SIZE;
+            player.reserveAmmo = GAME_CONSTANTS.RESERVE_AMMO;
+            player.isDead = false;
+
+            const spawnInfo = this.getSpawnPosition();
+            player.position = { x: spawnInfo.x, y: spawnInfo.y, z: spawnInfo.z };
+            player.rotation.yaw = spawnInfo.yaw || 0;
+            player.rotation.pitch = 0;
+        }
+
+        // Notify clients
+        const spawnData = {};
+        for (const [playerId, player] of this.players) {
+            spawnData[playerId] = {
+                spawnPosition: player.position,
+                spawnRotation: player.rotation
+            };
+        }
+
+        const playersData = {};
+        for (const [playerId, player] of this.players) {
+            playersData[playerId] = {
+                nickname: player.nickname
+            };
+        }
+
+        this.io.to(this.matchId).emit('roundStart', {
+            round: this.round,
+            scores: this.scores,
+            spawns: spawnData,
+            players: playersData,
+            roundsToWin: this.roundsToWin
+        });
+    }
+
+    tick() {
+        if (this.status !== MATCH_STATUS.IN_PROGRESS) return;
+
+        // Update time
+        const elapsed = (Date.now() - this.roundStartTime) / 1000;
+        this.timeRemaining = Math.max(0, GAME_CONSTANTS.ROUND_TIME - elapsed);
+
+        // Check time limit
+        if (this.timeRemaining <= 0) {
+            this.endRound('TIME_LIMIT', null);
+            return;
+        }
+
+        // Save state snapshot for lag compensation
+        this.saveStateSnapshot();
+
+        // Broadcast state update
+        this.broadcastState();
+    }
+
+    saveStateSnapshot() {
+        const snapshot = {
+            timestamp: Date.now(),
+            players: {}
+        };
+
+        for (const [playerId, player] of this.players) {
+            snapshot.players[playerId] = {
+                position: { ...player.position },
+                rotation: { ...player.rotation },
+                health: player.health
+            };
+        }
+
+        this.stateHistory.push(snapshot);
+
+        // Keep only last 500ms of history
+        const cutoff = Date.now() - 500;
+        this.stateHistory = this.stateHistory.filter(s => s.timestamp >= cutoff);
+    }
+
+    broadcastState() {
+        const stateUpdate = {
+            round: this.round,
+            scores: this.scores,
+            timeRemaining: this.timeRemaining,
+            roundsToWin: this.roundsToWin,
+            players: {}
+        };
+
+        for (const [playerId, player] of this.players) {
+            stateUpdate.players[playerId] = {
+                position: player.position,
+                rotation: player.rotation,
+                health: player.health,
+                isDead: player.isDead,
+                nickname: player.nickname // Include nickname
+            };
+        }
+
+        this.io.to(this.matchId).emit('stateUpdate', stateUpdate);
+    }
+
+    updatePlayerMovement(playerId, data) {
+        const player = this.players.get(playerId);
+        if (!player || player.isDead) return;
+
+        // Server-side collision validation
+        // Only ignore if the NEW position is clearly inside an object
+        if (checkMapCollision(data.position, GAME_CONSTANTS.PLAYER_RADIUS * 0.9)) { // Slightly more lenient buffer
+            return;
+        }
+
+        player.position = data.position;
+        player.rotation = data.rotation;
+        player.velocity = data.velocity;
+    }
+
+    handlePlayerShoot(playerId, data) {
+        const shooter = this.players.get(playerId);
+        if (!shooter || shooter.isDead) return;
+
+        if (shooter.ammo <= 0 && !this.infiniteAmmo) return;
+
+        if (!this.infiniteAmmo) {
+            shooter.ammo--;
+        }
+
+        // Notify clients that player fired (for sound/visuals)
+        this.io.to(this.matchId).emit('playerFired', {
+            shooterId: playerId
+        });
+
+        // Perform hit detection
+        const hitResult = this.hitDetection.performRaycast(
+            data.position,
+            data.direction,
+            this.players,
+            playerId,
+            data.timestamp,
+            this.stateHistory
+        );
+
+        if (hitResult.hit) {
+            const victim = this.players.get(hitResult.victimId);
+            if (victim) {
+                // Apply damage
+                const damage = this.calculateDamage(hitResult.hitbox);
+                victim.health -= damage;
+
+                const fatal = victim.health <= 0;
+                if (fatal) {
+                    victim.health = 0;
+                    victim.isDead = true;
+
+                    // Update score for the shooter
+                    this.scores[shooter.id]++;
+
+                    // Notify clients
+                    this.io.to(this.matchId).emit('playerDied', {
+                        victimId: hitResult.victimId,
+                        killerId: playerId,
+                        victimNickname: victim.nickname,
+                        killerNickname: shooter.nickname,
+                        hitbox: hitResult.hitbox
+                    });
+
+                    // Check win condition
+                    if (this.scores[shooter.id] >= this.roundsToWin) {
+                        this.endMatch(playerId);
+                    } else {
+                        // In infinite deathmatch, we just respawn the victim after a delay
+                        // instead of ending the round.
+                        setTimeout(() => {
+                            if (!this.players.has(hitResult.victimId)) return; // Already disconnected
+
+                            victim.health = GAME_CONSTANTS.MAX_HEALTH;
+                            victim.isDead = false;
+                            const spawn = this.getSpawnPosition();
+                            victim.position = { x: spawn.x, y: spawn.y, z: spawn.z };
+                            victim.rotation = { yaw: spawn.yaw, pitch: 0 };
+
+                            // Emit respawn event
+                            this.io.to(this.matchId).emit('playerRespawn', {
+                                playerId: hitResult.victimId,
+                                position: victim.position,
+                                rotation: victim.rotation
+                            });
+                        }, GAME_CONSTANTS.RESPAWN_TIME * 1000);
+                    }
+                }
+
+                // Notify clients of hit
+                this.io.to(this.matchId).emit('hitConfirmed', {
+                    shooterId: playerId,
+                    victimId: hitResult.victimId,
+                    shooterNickname: shooter.nickname,
+                    victimNickname: victim.nickname,
+                    hitbox: hitResult.hitbox,
+                    damage,
+                    fatal,
+                    impactPoint: hitResult.impactPoint
+                });
+            }
+        }
+    }
+
+    calculateDamage(hitbox) {
+        switch (hitbox) {
+            case 'HEAD':
+                return GAME_CONSTANTS.HEADSHOT_DAMAGE;
+            case 'UPPER_BODY':
+            case 'LOWER_BODY':
+                return GAME_CONSTANTS.BODY_DAMAGE;
+            case 'LEFT_ARM':
+            case 'RIGHT_ARM':
+            case 'LEFT_LEG':
+            case 'RIGHT_LEG':
+                return GAME_CONSTANTS.LIMB_DAMAGE;
+            default:
+                return GAME_CONSTANTS.LIMB_DAMAGE;
+        }
+    }
+
+    handlePlayerReload(playerId) {
+        const player = this.players.get(playerId);
+        if (!player || player.isDead) return;
+
+        const ammoNeeded = GAME_CONSTANTS.MAGAZINE_SIZE - player.ammo;
+        const ammoToTake = Math.min(ammoNeeded, player.reserveAmmo);
+
+        player.ammo += ammoToTake;
+        player.reserveAmmo -= ammoToTake;
+    }
+
+    handleScopeToggle(playerId, scoped) {
+        const player = this.players.get(playerId);
+        if (!player) return;
+
+        player.isScoped = scoped;
+    }
+
+    updateSettings(settings) {
+        if (settings.rounds !== undefined) this.roundsToWin = settings.rounds;
+        if (settings.autoRematch !== undefined) this.autoRematch = settings.autoRematch;
+        if (settings.infiniteAmmo !== undefined) this.infiniteAmmo = settings.infiniteAmmo;
+
+        // Broadcast update to all players
+        this.io.to(this.matchId).emit('settingsUpdated', {
+            settings: {
+                rounds: this.roundsToWin,
+                autoRematch: this.autoRematch,
+                infiniteAmmo: this.infiniteAmmo
+            }
+        });
+    }
+
+    handleRematchRequest(playerId) {
+        const player = this.players.get(playerId);
+        // Only accept rematch if match ended
+        if (!player || this.status !== MATCH_STATUS.MATCH_END) return;
+
+        player.wantsRematch = true;
+
+        // Check if all players want rematch
+        let allWantRematch = true;
+        for (const [id, p] of this.players) {
+            if (!p.wantsRematch) {
+                allWantRematch = false;
+                break;
+            }
+        }
+
+        if (allWantRematch && this.players.size > 0) {
+            this.resetMatch();
+        }
+    }
+
+    resetMatch() {
+        this.status = MATCH_STATUS.WAITING;
+        this.round = 1;
+        this.timeRemaining = GAME_CONSTANTS.ROUND_TIME;
+
+        // Reset players and scores
+        for (const [id, p] of this.players) {
+            this.scores[id] = 0;
+            p.wantsRematch = false;
+            p.isDead = false;
+            p.health = GAME_CONSTANTS.MAX_HEALTH;
+            p.ammo = GAME_CONSTANTS.MAGAZINE_SIZE;
+            p.reserveAmmo = GAME_CONSTANTS.RESERVE_AMMO;
+        }
+
+        // Notify clients
+        this.io.to(this.matchId).emit('matchReset', {
+            round: this.round,
+            scores: this.scores,
+            roundsToWin: this.roundsToWin
+        });
+
+        // Start game immediately
+        this.startGame();
+    }
+
+    endRound(reason, winnerId) {
+        this.status = MATCH_STATUS.ROUND_END;
+
+        this.io.to(this.matchId).emit('roundEnd', {
+            reason,
+            winnerId,
+            scores: this.scores
+        });
+
+        // Start next round after delay
+        setTimeout(() => {
+            this.round++;
+            this.status = MATCH_STATUS.IN_PROGRESS;
+            this.startRound();
+        }, GAME_CONSTANTS.RESPAWN_TIME * 1000);
+    }
+
+    endMatch(winnerId) {
+        this.status = MATCH_STATUS.MATCH_END;
+
+        if (this.tickInterval) {
+            clearInterval(this.tickInterval);
+            this.tickInterval = null;
+        }
+
+        this.io.to(this.matchId).emit('matchEnd', {
+            winnerId,
+            scores: this.scores
+        });
+
+        // AUTO REMATCH logic
+        if (this.autoRematch) {
+            setTimeout(() => {
+                if (this.status === MATCH_STATUS.MATCH_END) {
+                    this.resetMatch();
+                }
+            }, GAME_CONSTANTS.RESPAWN_TIME * 1000);
+        }
+    }
+
+    handlePlayerDisconnect(playerId) {
+        this.players.delete(playerId);
+        delete this.scores[playerId];
+
+        // End match if fewer than 2 players remain and match was in progress
+        if (this.status === MATCH_STATUS.IN_PROGRESS && this.players.size < 1) {
+            if (this.tickInterval) {
+                clearInterval(this.tickInterval);
+                this.tickInterval = null;
+            }
+        }
+    }
+
+    getSpawnPosition() {
+        // Use predefined "hidden" spawn points from MapData
+        const points = MAP_GEOMETRY.SPAWN_POINTS;
+        const randomPoint = points[Math.floor(Math.random() * points.length)];
+
+        return { ...randomPoint };
+    }
+}
